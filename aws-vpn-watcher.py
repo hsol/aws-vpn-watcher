@@ -17,6 +17,7 @@ import re
 import sys
 import threading
 from datetime import datetime, timezone
+from typing import List, Optional
 
 # ──────────────────────────────────────────────
 # 설정
@@ -57,7 +58,7 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 # SSO 프로필 자동 탐색
 # ──────────────────────────────────────────────
-def discover_sso_profiles() -> list[str]:
+def discover_sso_profiles() -> List[str]:
     """
     ~/.aws/config 를 파싱해 SSO 설정이 있는 프로필 목록을 반환합니다.
     sso_session 또는 sso_start_url 키를 가진 [profile xxx] 섹션을 SSO 프로필로 판단합니다.
@@ -90,7 +91,7 @@ def discover_sso_profiles() -> list[str]:
 # ──────────────────────────────────────────────
 # SSO 세션 유효성 확인
 # ──────────────────────────────────────────────
-def get_sso_start_url(profile: str) -> str | None:
+def get_sso_start_url(profile: str) -> Optional[str]:
     """~/.aws/config 에서 프로필의 sso_start_url을 반환합니다."""
     config_file = os.path.join(os.path.expanduser("~"), ".aws", "config")
     config = configparser.ConfigParser()
@@ -115,7 +116,7 @@ def get_sso_start_url(profile: str) -> str | None:
     return None
 
 
-def _check_cache_file(path: str, profile: str) -> bool | None:
+def _check_cache_file(path: str, profile: str) -> Optional[bool]:
     """
     캐시 파일 하나를 읽어 유효성을 반환합니다.
     유효 → True, 만료 → False, 파일 없음/읽기 실패 → None
@@ -221,7 +222,7 @@ def is_openvpn_running() -> bool:
     return result.returncode == 0
 
 
-def get_active_vpn_interfaces() -> list[str]:
+def get_active_vpn_interfaces() -> List[str]:
     """
     POINTOPOINT 플래그가 있고 RUNNING 상태인 utun 인터페이스 목록 반환.
     AWS VPN Client는 연결 시 이런 형태의 utun 인터페이스를 생성합니다.
@@ -263,7 +264,7 @@ def is_vpn_connected() -> bool:
 # ──────────────────────────────────────────────
 # 프로필 선택 다이얼로그
 # ──────────────────────────────────────────────
-def ask_profiles_via_dialog(profiles: list[str]) -> list[str]:
+def ask_profiles_via_dialog(profiles: List[str]) -> List[str]:
     """
     macOS 다이얼로그로 로그인할 프로필을 선택합니다.
     여러 항목 선택 가능. 취소 시 빈 리스트 반환.
@@ -363,7 +364,7 @@ def open_browser(url: str):
         log.error(f"브라우저 열기 실패: {e}")
 
 
-def run_sso_login(profiles: list[str]):
+def run_sso_login(profiles: List[str]):
     """
     aws sso login을 Python subprocess로 직접 실행합니다.
     stdout을 실시간으로 읽어 authorization URL이 나오면
