@@ -24,7 +24,7 @@ AWS VPN connects
 ## Installation
 
 ```bash
-git clone https://github.com/ppbstudios/aws-vpn-watcher.git
+git clone https://github.com/hsol/aws-vpn-watcher.git
 cd aws-vpn-watcher
 bash install.sh
 ```
