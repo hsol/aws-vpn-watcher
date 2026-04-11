@@ -459,10 +459,17 @@ def main():
                     continue
 
                 # 세션이 이미 유효한 프로필은 제외
-                expired = [p for p in available if not is_sso_session_valid(p)]
+                valid   = [p for p in available if is_sso_session_valid(p)]
+                expired = [p for p in available if p not in valid]
+
+                if valid:
+                    log.info(
+                        f"로그인 생략 프로필 ({len(valid)}개) — 이유: SSO 세션 유효 | "
+                        + ", ".join(valid)
+                    )
 
                 if not expired:
-                    log.info("모든 프로필 세션이 유효합니다. 로그인 생략.")
+                    log.info("로그인 불필요 — 모든 프로필의 SSO 세션이 유효합니다. 건너뜁니다.")
                     notify("AWS VPN 연결됨 ✅", "SSO 세션이 유효합니다. 로그인 생략.")
                     was_connected = connected
                     continue
@@ -473,7 +480,10 @@ def main():
                 if selected:
                     run_sso_login(selected)
                 else:
-                    log.info("프로필 미선택 - SSO 로그인 건너뜀")
+                    log.info(
+                        f"로그인 생략 — 이유: 사용자가 다이얼로그에서 취소 | "
+                        f"대상 프로필: {expired}"
+                    )
                     notify("AWS VPN Watcher", "SSO 로그인을 건너뛰었습니다.")
 
             elif not connected and was_connected:
