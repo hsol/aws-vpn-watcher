@@ -80,6 +80,14 @@ p "   ${GREEN}✓${NC} $MANAGE_DEST  (→ $CMD_NAME 커맨드)"
 p "⚙️  LaunchAgent plist 생성 중..."
 STDOUT_LOG="$LOG_DIR/aws-vpn-watcher.stdout.log"
 STDERR_LOG="$LOG_DIR/aws-vpn-watcher.stderr.log"
+PLIST_BACKUP="${PLIST_DEST}.aws-vpn-watcher.prev"
+
+# unload/load 사이 실패 시 복구용: 기존 plist 백업
+if [ -f "$PLIST_DEST" ]; then
+    cp "$PLIST_DEST" "$PLIST_BACKUP"
+else
+    rm -f "$PLIST_BACKUP"
+fi
 
 sed \
     -e "s|SCRIPT_PATH_PLACEHOLDER|$SCRIPT_DEST|g" \
@@ -95,8 +103,21 @@ if launchctl list 2>/dev/null | grep -q "com.user.aws-vpn-watcher"; then
     launchctl unload "$PLIST_DEST" 2>/dev/null || true
 fi
 p "🚀 LaunchAgent 등록 중..."
-launchctl load "$PLIST_DEST"
-p "   ${GREEN}✓${NC} 등록 완료 (부팅 시 자동 시작)"
+if launchctl load "$PLIST_DEST" 2>/dev/null; then
+    p "   ${GREEN}✓${NC} 등록 완료 (부팅 시 자동 시작)"
+    rm -f "$PLIST_BACKUP"
+else
+    p "${RED}❌ launchctl load 실패 — 이전 plist로 복구 시도${NC}"
+    if [ -f "$PLIST_BACKUP" ]; then
+        cp "$PLIST_BACKUP" "$PLIST_DEST"
+        if launchctl load "$PLIST_DEST" 2>/dev/null; then
+            p "   ${GREEN}✓${NC} 이전 LaunchAgent로 복구됨 (수동으로 install.sh 재실행 권장)"
+            exit 1
+        fi
+    fi
+    p "${RED}❌ 복구 실패 — 수동으로 bash install.sh 또는 avwatcher start 를 실행하세요.${NC}"
+    exit 1
+fi
 
 # ── 7. PATH 등록 (~/.zshrc) ────────────────────
 p "🔗 PATH 등록 중 ($SHELL_RC)..."

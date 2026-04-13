@@ -7,7 +7,7 @@ AWS VPN Client에 연결될 때 `aws sso login`을 자동으로 실행해주는 
 aws-vpn-watcher는 macOS LaunchAgent로 백그라운드에서 상시 실행됩니다. `openvpn` 프로세스와 `utun` 네트워크 인터페이스를 감시하다가 AWS VPN 연결이 감지되면 프로필 선택 다이얼로그를 띄우고, 선택한 프로필에 대해 브라우저를 자동으로 열어 SSO 인증을 진행합니다.
 
 SSO 세션이 아직 유효한 경우에는 로그인을 건너뛰고 이유를 로그로 남깁니다.
-또한 백그라운드 실행 중 하루에 한 번 최신 GitHub release를 확인하고, 새 버전이 있으면 자동 업데이트를 진행합니다.
+또한 백그라운드 실행 중 하루에 한 번 최신 GitHub release를 확인하고, 새 버전이 있으면 자동 업데이트를 진행합니다. 업데이트는 전체 제거 없이 파일만 갱신한 뒤 LaunchAgent를 다시 등록하며, 등록 실패 시 이전 plist로 복구를 시도합니다.
 
 ```text
 AWS VPN 연결됨

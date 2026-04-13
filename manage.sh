@@ -8,7 +8,7 @@
 #   avwatcher status     실행 상태 확인
 #   avwatcher logs       실시간 로그 보기
 #   avwatcher uninstall  완전 제거
-#   avwatcher update     최신 release 확인 후 필요 시 업데이트
+#   avwatcher update     최신 release 확인 후 필요 시 in-place 재설치
 # ─────────────────────────────────────────────────────────────
 
 GREEN='\033[0;32m'
@@ -235,19 +235,22 @@ cmd_update() {
     fi
     p "   ${GREEN}✓${NC} git pull 완료"
 
-    p "3) 실행 중 서비스 중지 시도..."
-    if launchctl list 2>/dev/null | grep -q "$PLIST_NAME"; then
-        launchctl unload "$PLIST_PATH" 2>/dev/null || true
-        p "   ${GREEN}✓${NC} 서비스 중지 완료"
-    else
-        p "   ${YELLOW}이미 중지 상태 — 스킵${NC}"
+    # uninstall 하지 않음: 실패 시 바이너리/plist가 사라져 서비스가 복구 불가능해질 수 있음.
+    # install.sh 가 파일 덮어쓰기 → unload/load 만 수행하므로 그대로 호출.
+    p "3) 설치 스크립트 실행 (파일 갱신 및 LaunchAgent 재등록)..."
+    if ! bash "$REPO_INSTALL_SCRIPT"; then
+        p "${RED}❌ 설치 스크립트 실패${NC}"
+        p "   서비스가 내려갔을 수 있습니다. 복구 시도 중..."
+        if [ -f "$PLIST_PATH" ] && ! launchctl list 2>/dev/null | grep -q "$PLIST_NAME"; then
+            launchctl load "$PLIST_PATH" 2>/dev/null || true
+            if launchctl list 2>/dev/null | grep -q "$PLIST_NAME"; then
+                p "   ${GREEN}✓${NC} LaunchAgent 로드로 복구됨"
+            else
+                p "   ${YELLOW}⚠️  자동 복구 실패 — 수동: ${BOLD}bash $REPO_INSTALL_SCRIPT${NC} 또는 ${BOLD}avwatcher start${NC}"
+            fi
+        fi
+        exit 1
     fi
-
-    p "4) 기존 설치 제거..."
-    cmd_uninstall
-
-    p "5) 재설치 진행..."
-    bash "$REPO_INSTALL_SCRIPT"
 
     printf "\n"
     p "${GREEN}${BOLD}✅ 업데이트 완료!${NC}"
@@ -275,6 +278,6 @@ case "${1:-}" in
         printf "  status     실행 상태 및 최근 로그 확인\n"
         printf "  logs       실시간 로그 스트리밍\n"
         printf "  uninstall  완전 제거 (파일, plist, PATH 블록 모두)\n"
-        printf "  update     최신 release 확인 후 필요 시 업데이트 실행\n"
+        printf "  update     최신 release 확인 후 필요 시 in-place 재설치\n"
         ;;
 esac
