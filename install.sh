@@ -70,7 +70,9 @@ cp "$SRC_DIR/$SCRIPT_NAME" "$SCRIPT_DEST"
 chmod +x "$SCRIPT_DEST"
 p "   ${GREEN}✓${NC} $SCRIPT_DEST"
 
-cp "$SRC_DIR/$MANAGE_NAME" "$MANAGE_DEST"
+sed \
+    -e "s|__REPO_DIR__|$SRC_DIR|g" \
+    "$SRC_DIR/$MANAGE_NAME" > "$MANAGE_DEST"
 chmod +x "$MANAGE_DEST"
 p "   ${GREEN}✓${NC} $MANAGE_DEST  (→ $CMD_NAME 커맨드)"
 
@@ -126,3 +128,4 @@ p "   ${BOLD}avwatcher start${NC}      — 서비스 시작"
 p "   ${BOLD}avwatcher restart${NC}    — 서비스 재시작"
 p "   ${BOLD}avwatcher logs${NC}       — 실시간 로그"
 p "   ${BOLD}avwatcher uninstall${NC}  — 완전 제거"
+p "   ${BOLD}avwatcher update${NC}     — stop/uninstall/reinstall 자동 실행"

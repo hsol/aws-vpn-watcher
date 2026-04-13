@@ -8,6 +8,7 @@
 #   avwatcher status     실행 상태 확인
 #   avwatcher logs       실시간 로그 보기
 #   avwatcher uninstall  완전 제거
+#   avwatcher update     git pull + stop/uninstall/reinstall 자동 실행
 # ─────────────────────────────────────────────────────────────
 
 GREEN='\033[0;32m'
@@ -26,6 +27,12 @@ LOG_FILE="$HOME/.local/log/aws-vpn-watcher.log"
 SHELL_RC="$HOME/.zshrc"
 MARKER_BEGIN="# >>> aws-vpn-watcher >>>"
 MARKER_END="# <<< aws-vpn-watcher <<<"
+REPO_DIR="__REPO_DIR__"
+
+if [ "$REPO_DIR" = "__REPO_DIR__" ]; then
+    REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
+REPO_INSTALL_SCRIPT="$REPO_DIR/install.sh"
 
 check_installed() {
     if [ ! -f "$PLIST_PATH" ]; then
@@ -141,6 +148,48 @@ cmd_uninstall() {
     p "   ${BOLD}source $SHELL_RC${NC}"
 }
 
+cmd_update() {
+    p "${BOLD}🔄 AWS VPN Watcher 업데이트 시작${NC}"
+    printf "────────────────────────────────────\n"
+
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        p "${RED}❌ Git 저장소를 찾을 수 없습니다: $REPO_DIR${NC}"
+        p "   저장소 루트에서 수동 업데이트 후 install.sh를 실행하세요."
+        exit 1
+    fi
+
+    if [ ! -f "$REPO_INSTALL_SCRIPT" ]; then
+        p "${RED}❌ 설치 스크립트를 찾을 수 없습니다: $REPO_INSTALL_SCRIPT${NC}"
+        p "   저장소 상태를 확인한 뒤 수동으로 bash install.sh를 실행하세요."
+        exit 1
+    fi
+
+    p "1) 최신 코드 가져오기 (git pull)..."
+    if ! git -C "$REPO_DIR" pull; then
+        p "${RED}❌ git pull 실패 — 충돌/권한 문제를 확인하세요.${NC}"
+        exit 1
+    fi
+    p "   ${GREEN}✓${NC} git pull 완료"
+
+    p "2) 실행 중 서비스 중지 시도..."
+    if launchctl list 2>/dev/null | grep -q "$PLIST_NAME"; then
+        launchctl unload "$PLIST_PATH" 2>/dev/null || true
+        p "   ${GREEN}✓${NC} 서비스 중지 완료"
+    else
+        p "   ${YELLOW}이미 중지 상태 — 스킵${NC}"
+    fi
+
+    p "3) 기존 설치 제거..."
+    cmd_uninstall
+
+    p "4) 재설치 진행..."
+    bash "$REPO_INSTALL_SCRIPT"
+
+    printf "\n"
+    p "${GREEN}${BOLD}✅ 업데이트 완료!${NC}"
+    p "   상태 확인: ${BOLD}avwatcher status${NC}"
+}
+
 # ── 커맨드 라우팅 ──────────────────────────────
 case "${1:-}" in
     start)     cmd_start     ;;
@@ -149,6 +198,7 @@ case "${1:-}" in
     status)    cmd_status    ;;
     logs)      cmd_logs      ;;
     uninstall) cmd_uninstall ;;
+    update)    cmd_update    ;;
     *)
         p "${BOLD}avwatcher${NC} — AWS VPN 연결을 감지하여 SSO 로그인을 자동으로 실행합니다."
         printf "\n"
@@ -161,5 +211,6 @@ case "${1:-}" in
         printf "  status     실행 상태 및 최근 로그 확인\n"
         printf "  logs       실시간 로그 스트리밍\n"
         printf "  uninstall  완전 제거 (파일, plist, PATH 블록 모두)\n"
+        printf "  update     git pull → stop → uninstall → reinstall 자동 실행\n"
         ;;
 esac
