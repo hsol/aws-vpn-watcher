@@ -29,7 +29,7 @@ MARKER_BEGIN="# >>> aws-vpn-watcher >>>"
 MARKER_END="# <<< aws-vpn-watcher <<<"
 REPO_DIR="__REPO_DIR__"
 
-if [ "$REPO_DIR" = "__REPO_DIR__" ]; then
+if [ ! -d "$REPO_DIR/.git" ]; then
     REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 fi
 REPO_INSTALL_SCRIPT="$REPO_DIR/install.sh"
