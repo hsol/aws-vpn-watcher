@@ -8,7 +8,7 @@
 #   avwatcher status     실행 상태 확인
 #   avwatcher logs       실시간 로그 보기
 #   avwatcher uninstall  완전 제거
-#   avwatcher update     git pull + stop/uninstall/reinstall 자동 실행
+#   avwatcher update     최신 release 확인 후 필요 시 업데이트
 # ─────────────────────────────────────────────────────────────
 
 GREEN='\033[0;32m'
@@ -33,6 +33,43 @@ if [ ! -d "$REPO_DIR/.git" ]; then
     REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 fi
 REPO_INSTALL_SCRIPT="$REPO_DIR/install.sh"
+
+get_repo_slug() {
+    local remote_url slug
+    remote_url="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || echo "")"
+    if [ -z "$remote_url" ]; then
+        echo ""
+        return
+    fi
+
+    # https://github.com/owner/repo(.git)
+    if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/.]+)(\.git)?$ ]]; then
+        slug="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        echo "$slug"
+        return
+    fi
+
+    echo ""
+}
+
+get_latest_release_tag() {
+    local repo_slug latest_tag
+    repo_slug="$1"
+    latest_tag=""
+
+    # gh가 있으면 우선 사용
+    if command -v gh >/dev/null 2>&1; then
+        latest_tag="$(gh release view --repo "$repo_slug" --json tagName -q '.tagName' 2>/dev/null || echo "")"
+    fi
+
+    # gh가 없거나 실패하면 GitHub API fallback
+    if [ -z "$latest_tag" ]; then
+        latest_tag="$(curl -fsSL "https://api.github.com/repos/$repo_slug/releases/latest" 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null || echo "")"
+    fi
+
+    echo "$latest_tag"
+}
 
 check_installed() {
     if [ ! -f "$PLIST_PATH" ]; then
@@ -164,14 +201,41 @@ cmd_update() {
         exit 1
     fi
 
-    p "1) 최신 코드 가져오기 (git pull)..."
+    p "1) 최신 release 확인..."
+    REPO_SLUG="$(get_repo_slug)"
+    if [ -z "$REPO_SLUG" ]; then
+        p "${YELLOW}⚠️  origin 원격에서 GitHub 저장소 정보를 파싱하지 못했습니다.${NC}"
+        p "   release 확인 없이 기존 방식(git pull)으로 진행합니다."
+    else
+        LATEST_RELEASE_TAG="$(get_latest_release_tag "$REPO_SLUG")"
+        CURRENT_RELEASE_TAG="$(git -C "$REPO_DIR" describe --tags --abbrev=0 2>/dev/null || echo "")"
+
+        if [ -n "$LATEST_RELEASE_TAG" ]; then
+            p "   최신 release: $LATEST_RELEASE_TAG"
+            if [ -n "$CURRENT_RELEASE_TAG" ]; then
+                p "   현재 버전:   $CURRENT_RELEASE_TAG"
+            else
+                p "   현재 버전:   (태그 없음)"
+            fi
+
+            if [ "$LATEST_RELEASE_TAG" = "$CURRENT_RELEASE_TAG" ]; then
+                p "${GREEN}✅ 이미 최신 release 입니다. 업데이트를 건너뜁니다.${NC}"
+                return 0
+            fi
+        else
+            p "${YELLOW}⚠️  최신 release 정보를 가져오지 못했습니다.${NC}"
+            p "   release 확인 없이 기존 방식(git pull)으로 진행합니다."
+        fi
+    fi
+
+    p "2) 최신 코드 가져오기 (git pull)..."
     if ! git -C "$REPO_DIR" pull; then
         p "${RED}❌ git pull 실패 — 충돌/권한 문제를 확인하세요.${NC}"
         exit 1
     fi
     p "   ${GREEN}✓${NC} git pull 완료"
 
-    p "2) 실행 중 서비스 중지 시도..."
+    p "3) 실행 중 서비스 중지 시도..."
     if launchctl list 2>/dev/null | grep -q "$PLIST_NAME"; then
         launchctl unload "$PLIST_PATH" 2>/dev/null || true
         p "   ${GREEN}✓${NC} 서비스 중지 완료"
@@ -179,10 +243,10 @@ cmd_update() {
         p "   ${YELLOW}이미 중지 상태 — 스킵${NC}"
     fi
 
-    p "3) 기존 설치 제거..."
+    p "4) 기존 설치 제거..."
     cmd_uninstall
 
-    p "4) 재설치 진행..."
+    p "5) 재설치 진행..."
     bash "$REPO_INSTALL_SCRIPT"
 
     printf "\n"
@@ -211,6 +275,6 @@ case "${1:-}" in
         printf "  status     실행 상태 및 최근 로그 확인\n"
         printf "  logs       실시간 로그 스트리밍\n"
         printf "  uninstall  완전 제거 (파일, plist, PATH 블록 모두)\n"
-        printf "  update     git pull → stop → uninstall → reinstall 자동 실행\n"
+        printf "  update     최신 release 확인 후 필요 시 업데이트 실행\n"
         ;;
 esac

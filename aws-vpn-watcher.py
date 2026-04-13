@@ -28,12 +28,16 @@ STABILIZE_DELAY = 2   # VPN 연결 후 다이얼로그 표시 전 대기 (초)
 SSO_RECHECK_WHILE_CONNECTED_SEC = 60
 # 연결 유지 중 만료가 계속일 때 알림만 주기적으로 (다이얼로그 없음, 초)
 STILL_EXPIRED_NOTIFY_INTERVAL_SEC = 900
+# 자동 업데이트 체크 주기 (초, 기본 24시간)
+AUTO_UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60
+AUTO_UPDATE_STATE_FILE = os.path.expanduser("~/.local/state/aws-vpn-watcher-update.json")
 LOG_FILE = os.path.expanduser("~/.local/log/aws-vpn-watcher.log")
 
 # ── 시스템 명령어 절대경로 (LaunchAgent는 PATH가 제한적) ──
 CMD_PGREP     = "/usr/bin/pgrep"
 CMD_IFCONFIG  = "/sbin/ifconfig"
 CMD_OSASCRIPT = "/usr/bin/osascript"
+CMD_AVWATCHER = os.path.expanduser("~/.local/bin/avwatcher")
 CMD_AWS       = next(
     (p for p in [
         "/usr/local/bin/aws",
@@ -57,6 +61,79 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+
+def _load_auto_update_state() -> dict:
+    try:
+        if not os.path.isfile(AUTO_UPDATE_STATE_FILE):
+            return {}
+        with open(AUTO_UPDATE_STATE_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning(f"자동 업데이트 상태 읽기 실패: {e}")
+        return {}
+
+
+def _save_auto_update_state(state: dict):
+    try:
+        os.makedirs(os.path.dirname(AUTO_UPDATE_STATE_FILE), exist_ok=True)
+        with open(AUTO_UPDATE_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log.warning(f"자동 업데이트 상태 저장 실패: {e}")
+
+
+_auto_update_lock = threading.Lock()
+_auto_update_running = False
+
+
+def _run_auto_update():
+    global _auto_update_running
+    with _auto_update_lock:
+        if _auto_update_running:
+            return
+        _auto_update_running = True
+
+    try:
+        if not os.path.isfile(CMD_AVWATCHER):
+            log.warning(f"자동 업데이트 실패: avwatcher 커맨드 없음 ({CMD_AVWATCHER})")
+            return
+
+        log.info("자동 업데이트 점검 시작 (avwatcher update)")
+        proc = subprocess.Popen(
+            [CMD_AVWATCHER, "update"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for line in iter(proc.stdout.readline, ""):
+            line = line.rstrip()
+            if line:
+                log.info(f"[auto-update] {line}")
+        proc.wait()
+
+        if proc.returncode == 0:
+            log.info("자동 업데이트 점검 완료")
+        else:
+            log.error(f"자동 업데이트 실패 (returncode={proc.returncode})")
+    except Exception as e:
+        log.error(f"자동 업데이트 실행 중 오류: {e}", exc_info=True)
+    finally:
+        with _auto_update_lock:
+            _auto_update_running = False
+
+
+def maybe_trigger_daily_auto_update(now_ts: float):
+    state = _load_auto_update_state()
+    last_check_ts = float(state.get("last_check_ts", 0.0))
+    if now_ts - last_check_ts < AUTO_UPDATE_CHECK_INTERVAL_SEC:
+        return
+
+    # 점검 시각을 먼저 저장해, 실패 시에도 과도한 반복 실행을 방지
+    state["last_check_ts"] = now_ts
+    _save_auto_update_state(state)
+
+    threading.Thread(target=_run_auto_update, daemon=True).start()
 
 
 # ──────────────────────────────────────────────
@@ -444,6 +521,10 @@ def main():
         f"연결 유지 중 SSO 재점검: {SSO_RECHECK_WHILE_CONNECTED_SEC}초마다 "
         f"(만료 전환 시 알림·다이얼로그)"
     )
+    log.info(
+        f"자동 업데이트 점검: {AUTO_UPDATE_CHECK_INTERVAL_SEC // 3600}시간마다 "
+        "(release 기준 필요 시 업데이트)"
+    )
     log.info("=" * 50)
 
     was_connected = False
@@ -454,6 +535,9 @@ def main():
 
     while True:
         try:
+            now_ts = time.time()
+            maybe_trigger_daily_auto_update(now_ts)
+
             connected = is_vpn_connected()
 
             if connected and not was_connected:
