@@ -30,7 +30,11 @@ SSO_RECHECK_WHILE_CONNECTED_SEC = 60
 STILL_EXPIRED_NOTIFY_INTERVAL_SEC = 900
 # 자동 업데이트 체크 주기 (초, 기본 24시간)
 AUTO_UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60
-AUTO_UPDATE_STATE_FILE = os.path.expanduser("~/.local/state/aws-vpn-watcher-update.json")
+HOME_DIR = os.path.expanduser("~")
+AUTO_UPDATE_STATE_CANDIDATES = [
+    os.path.join(HOME_DIR, ".local", "log", "aws-vpn-watcher-update.json"),
+    os.path.join(HOME_DIR, ".aws-vpn-watcher-update.json"),
+]
 LOG_FILE = os.path.expanduser("~/.local/log/aws-vpn-watcher.log")
 
 # ── 시스템 명령어 절대경로 (LaunchAgent는 PATH가 제한적) ──
@@ -63,6 +67,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def _resolve_auto_update_state_file() -> str:
+    for path in AUTO_UPDATE_STATE_CANDIDATES:
+        parent = os.path.dirname(path)
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception:
+            continue
+        if os.path.isdir(parent) and os.access(parent, os.W_OK):
+            return path
+    # 마지막 fallback: 사용자 홈 루트 파일
+    return os.path.join(HOME_DIR, ".aws-vpn-watcher-update.json")
+
+
+AUTO_UPDATE_STATE_FILE = _resolve_auto_update_state_file()
+
+
 def _load_auto_update_state() -> dict:
     try:
         if not os.path.isfile(AUTO_UPDATE_STATE_FILE):
@@ -76,7 +96,6 @@ def _load_auto_update_state() -> dict:
 
 def _save_auto_update_state(state: dict):
     try:
-        os.makedirs(os.path.dirname(AUTO_UPDATE_STATE_FILE), exist_ok=True)
         with open(AUTO_UPDATE_STATE_FILE, "w") as f:
             json.dump(state, f)
     except Exception as e:
