@@ -661,10 +661,14 @@ def main():
                                     >= STILL_EXPIRED_NOTIFY_INTERVAL_SEC
                                 ):
                                     notify(
-                                        "AWS SSO 만료",
-                                        "세션이 아직 만료 상태입니다. "
-                                        "aws sso login 또는 다음 연결 시 다이얼로그를 이용하세요.",
+                                        "AWS SSO 만료 — 자동 재로그인",
+                                        "세션이 아직 만료 상태여서 자동으로 재로그인을 시도합니다.",
                                     )
+                                    log.info(
+                                        "만료 상태 지속 감지 — 만료 프로필 자동 재로그인 시도: "
+                                        + ", ".join(expired)
+                                    )
+                                    run_sso_login(expired)
                                     last_still_expired_notify_ts = now_ts
                             else:
                                 connected_sso_all_valid_prev = False
