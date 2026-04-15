@@ -18,6 +18,7 @@ import re
 import sys
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 # ──────────────────────────────────────────────
@@ -39,6 +40,7 @@ AUTO_UPDATE_STATE_CANDIDATES = [
     os.path.join(HOME_DIR, ".aws-vpn-watcher-update.json"),
 ]
 LOG_FILE = os.path.expanduser("~/.local/log/aws-vpn-watcher.log")
+AWS_VPN_CLIENT_APP = "/Applications/AWS VPN Client/AWS VPN Client.app"
 
 # ── 시스템 명령어 절대경로 (LaunchAgent는 PATH가 제한적) ──
 CMD_PGREP     = "/usr/bin/pgrep"
@@ -431,30 +433,64 @@ CMD_TERMINAL_NOTIFIER = next(
     None,
 )
 
-AWS_VPN_ICON = "/Applications/AWS VPN Client/AWS VPN Client.app/Contents/Resources/AppIcon.icns"
+AWS_VPN_ICON = (
+    "/Applications/AWS VPN Client/AWS VPN Client.app/Contents/Resources/AppIcon.icns"
+)
 
 
-def notify(title: str, message: str):
+def _notify_open_url(on_click: Optional[str]) -> Optional[str]:
+    """
+    terminal-notifier -open 에 넣을 URL.
+    None → -open 생략(클릭 시 별도 동작 없음).
+    """
+    if on_click is None:
+        return None
+    if on_click == "log":
+        p = Path(LOG_FILE)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return p.as_uri()
+    if on_click == "aws_vpn":
+        app = Path(AWS_VPN_CLIENT_APP)
+        if app.is_dir():
+            return app.as_uri()
+        return _notify_open_url("log")
+    if on_click.startswith(("http://", "https://", "file:")):
+        return on_click
+    p = Path(on_click).expanduser()
+    if p.exists():
+        return p.as_uri()
+    return _notify_open_url("log")
+
+
+def notify(title: str, message: str, *, on_click: Optional[str] = "log"):
     """
     macOS 알림 센터에 알림 표시.
-    terminal-notifier가 설치된 경우 AWS VPN Client 아이콘과 함께 표시하고,
-    없으면 osascript로 fallback합니다.
+    terminal-notifier 사용 시 -open 으로 클릭(보기) 동작을 연결합니다.
+    on_click=None 이면 -open 을 넣지 않습니다.
+    osascript fallback 은 시스템 제약으로 클릭 URL을 붙이지 못합니다.
     """
     try:
-        if CMD_TERMINAL_NOTIFIER and os.path.isfile(AWS_VPN_ICON):
-            subprocess.run(
-                [
-                    CMD_TERMINAL_NOTIFIER,
-                    "-title",   title,
-                    "-message", message,
-                    "-appIcon", AWS_VPN_ICON,
-                    "-sound",   "Glass",
-                ],
-                check=False,
-                capture_output=True,
-            )
+        open_url = _notify_open_url(on_click)
+        if CMD_TERMINAL_NOTIFIER:
+            cmd: List[str] = [
+                CMD_TERMINAL_NOTIFIER,
+                "-title",
+                title,
+                "-message",
+                message,
+                "-sound",
+                "Glass",
+            ]
+            if os.path.isfile(AWS_VPN_ICON):
+                cmd.extend(["-appIcon", AWS_VPN_ICON])
+            if open_url:
+                cmd.extend(["-open", open_url])
+            subprocess.run(cmd, check=False, capture_output=True)
         else:
-            # fallback: osascript 기본 알림
+            # fallback: 클릭 시 동작 없음(시스템이 보기 버튼을 보여줄 수 있음)
             script = f'display notification "{message}" with title "{title}" sound name "Glass"'
             subprocess.run([CMD_OSASCRIPT, "-e", script], check=False)
     except Exception:
@@ -624,7 +660,11 @@ def main():
             if connected and not was_connected:
                 ifaces = get_active_vpn_interfaces()
                 log.info(f"✅ VPN 연결 감지! 인터페이스: {ifaces}")
-                notify("AWS VPN 연결됨 🔐", "프로필을 선택해주세요...")
+                notify(
+                    "AWS VPN 연결됨 🔐",
+                    "프로필을 선택해주세요...",
+                    on_click="aws_vpn",
+                )
 
                 # 연결 안정화 대기
                 time.sleep(STABILIZE_DELAY)
@@ -633,7 +673,11 @@ def main():
                 available = discover_sso_profiles()
                 if not available:
                     log.warning("SSO 프로필을 찾을 수 없습니다. ~/.aws/config 를 확인하세요.")
-                    notify("AWS VPN Watcher ⚠️", "SSO 프로필을 찾을 수 없습니다.")
+                    notify(
+                        "AWS VPN Watcher ⚠️",
+                        "SSO 프로필을 찾을 수 없습니다.",
+                        on_click=os.path.expanduser("~/.aws/config"),
+                    )
                     connected_sso_all_valid_prev = None
                     last_mid_sso_check_ts = time.time()
                     was_connected = connected
@@ -651,7 +695,11 @@ def main():
 
                 if not expired:
                     log.info("로그인 불필요 — 모든 프로필의 SSO 세션이 유효합니다. 건너뜁니다.")
-                    notify("AWS VPN 연결됨 ✅", "SSO 세션이 유효합니다. 로그인 생략.")
+                    notify(
+                        "AWS VPN 연결됨 ✅",
+                        "SSO 세션이 유효합니다. 로그인 생략.",
+                        on_click="aws_vpn",
+                    )
                     connected_sso_all_valid_prev = True
                     last_mid_sso_check_ts = time.time()
                     was_connected = connected
@@ -677,7 +725,11 @@ def main():
 
             elif not connected and was_connected:
                 log.info("⚠️  VPN 연결 해제됨")
-                notify("AWS VPN 연결 해제", "VPN 연결이 끊겼습니다.")
+                notify(
+                    "AWS VPN 연결 해제",
+                    "VPN 연결이 끊겼습니다.",
+                    on_click="aws_vpn",
+                )
                 connected_sso_all_valid_prev = None
                 last_still_expired_notify_ts = 0.0
 
@@ -698,10 +750,14 @@ def main():
                                 notify(
                                     "AWS SSO 만료 🔐",
                                     "VPN은 연결됐지만 SSO가 만료됐습니다. 재로그인할 프로필을 고르세요.",
+                                    on_click="log",
                                 )
                                 selected = ask_profiles_via_dialog(expired)
                                 if selected:
-                                    run_sso_login(selected)
+                                    run_sso_login_async(
+                                        selected,
+                                        reason="VPN 연결 유지 중 SSO 만료",
+                                    )
                                     available = discover_sso_profiles(verbose=False)
                                     valid_after = [
                                         p for p in available if is_sso_session_valid(p)
@@ -725,6 +781,7 @@ def main():
                                     notify(
                                         "AWS SSO 만료 — 자동 재로그인",
                                         "세션이 아직 만료 상태여서 자동으로 재로그인을 시도합니다.",
+                                        on_click="log",
                                     )
                                     log.info(
                                         "만료 상태 지속 감지 — 만료 프로필 자동 재로그인 시도: "
