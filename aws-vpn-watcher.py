@@ -4,8 +4,12 @@ AWS VPN Watcher
 ---------------
 AWS VPN Client 연결을 감지하면 macOS 다이얼로그로 프로필을 선택하고
 자동으로 aws sso login을 실행합니다.
+
+SSO 자동 로그인을 끄려면 환경변수 AWS_VPN_WATCHER_SKIP_SSO_LOGIN=1 이거나
+실행 인자 --no-sso-login 을 사용하세요 (LaunchAgent plist 의 EnvironmentVariables 등).
 """
 
+import argparse
 import configparser
 import hashlib
 import json
@@ -19,7 +23,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 # ──────────────────────────────────────────────
 # 설정
@@ -41,6 +45,19 @@ AUTO_UPDATE_STATE_CANDIDATES = [
 ]
 LOG_FILE = os.path.expanduser("~/.local/log/aws-vpn-watcher.log")
 AWS_VPN_CLIENT_APP = "/Applications/AWS VPN Client/AWS VPN Client.app"
+# macOS AWS VPN Client 가 커넥션 목록을 저장하는 경로 (ProfileName 기준으로 AWS CLI 프로필과 맞추는 전제)
+AWS_VPN_CLIENT_CONNECTION_PROFILES_FILE = os.path.join(
+    HOME_DIR, ".config", "AWSVPNClient", "ConnectionProfiles"
+)
+# VPN 클라이언트 ProfileName → ~/.aws/config SSO 프로필 이름 (이름이 다를 때 사용자가 한 번 지정)
+VPN_SSO_MAPPINGS_DIR = os.path.join(HOME_DIR, ".config", "aws-vpn-watcher")
+VPN_SSO_MAPPINGS_FILE = os.path.join(VPN_SSO_MAPPINGS_DIR, "vpn-sso-mappings.json")
+
+
+def _env_truthy(name: str) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
 
 # ── 시스템 명령어 절대경로 (LaunchAgent는 PATH가 제한적) ──
 CMD_PGREP     = "/usr/bin/pgrep"
@@ -194,6 +211,277 @@ def discover_sso_profiles(*, verbose: bool = True) -> List[str]:
     if verbose:
         log.info(f"탐색된 SSO 프로필: {sso_profiles}")
     return sorted(sso_profiles)
+
+
+def load_aws_vpn_client_connection_profile_names() -> Optional[Set[str]]:
+    """
+    AWS VPN Client 에 등록된 커넥션의 ProfileName 집합을 반환합니다.
+    ConnectionProfiles 파일이 없으면 None (레거시 동작: config 의 전체 SSO 프로필 사용).
+    파일은 있으나 읽기 실패·형식 오류면 빈 set.
+    """
+    path = AWS_VPN_CLIENT_CONNECTION_PROFILES_FILE
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log.warning(f"AWS VPN Client ConnectionProfiles 읽기 실패 ({path}): {e}")
+        return set()
+
+    raw = data.get("ConnectionProfiles")
+    if not isinstance(raw, list):
+        log.warning("ConnectionProfiles JSON 에 ConnectionProfiles 배열이 없습니다.")
+        return set()
+
+    names: Set[str] = set()
+    for item in raw:
+        if isinstance(item, dict):
+            pn = item.get("ProfileName")
+            if pn:
+                names.add(str(pn))
+    return names
+
+
+def load_vpn_sso_mappings() -> dict[str, str]:
+    """VPN ProfileName → AWS CLI SSO 프로필 이름."""
+    if not os.path.isfile(VPN_SSO_MAPPINGS_FILE):
+        return {}
+    try:
+        with open(VPN_SSO_MAPPINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log.warning(f"VPN↔SSO 매핑 파일 읽기 실패 ({VPN_SSO_MAPPINGS_FILE}): {e}")
+        return {}
+    raw = data.get("vpn_to_sso_profile")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+            out[k.strip()] = v.strip()
+    return out
+
+
+def save_vpn_sso_mappings(mappings: dict[str, str]):
+    try:
+        os.makedirs(VPN_SSO_MAPPINGS_DIR, exist_ok=True)
+        payload = {
+            "version": 1,
+            "vpn_to_sso_profile": dict(sorted(mappings.items())),
+        }
+        with open(VPN_SSO_MAPPINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        log.info(f"VPN↔SSO 매핑 저장: {VPN_SSO_MAPPINGS_FILE}")
+    except Exception as e:
+        log.warning(f"VPN↔SSO 매핑 저장 실패: {e}")
+
+
+def _mapping_sso_for_vpn(mappings: dict[str, str], vpn_profile_name: str) -> Optional[str]:
+    """저장된 매핑에서 VPN ProfileName 에 대응하는 SSO 프로필 이름 (정확히 또는 대소문자 무시)."""
+    if vpn_profile_name in mappings:
+        return mappings[vpn_profile_name]
+    lk = vpn_profile_name.lower()
+    for k, v in mappings.items():
+        if k.lower() == lk:
+            return v
+    return None
+
+
+def _vpn_names_needing_user_mapping(
+    all_sso: List[str], vpn_names: Set[str], mappings: dict[str, str]
+) -> List[str]:
+    """
+    (1) 이름이 같은 SSO 프로필이 없고
+    (2) 유효한 저장 매핑도 없는
+    VPN ProfileName 목록.
+    """
+    need: List[str] = []
+    for vpn in sorted(vpn_names):
+        if any(p.lower() == vpn.lower() for p in all_sso):
+            continue
+        mapped = _mapping_sso_for_vpn(mappings, vpn)
+        if mapped and mapped in all_sso:
+            continue
+        need.append(vpn)
+    return need
+
+
+def _applescript_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def ask_sso_profile_for_vpn_mapping_dialog(
+    vpn_profile_name: str, sso_profiles: List[str]
+) -> Optional[str]:
+    """
+    이름이 맞지 않는 VPN 커넥션 하나에 대해, 연결할 SSO 프로필을 한 개 고릅니다.
+    취소·빈 선택 → None.
+    """
+    if not sso_profiles:
+        return None
+    safe_vpn = _applescript_escape(vpn_profile_name)
+    items_str = "{" + ", ".join(f'"{_applescript_escape(p)}"' for p in sso_profiles) + "}"
+    apple_script = f"""
+set profileList to {items_str}
+set chosen to choose from list profileList ¬
+    with prompt "VPN 커넥션과 AWS SSO 프로필 이름이 다릅니다.\\n\\nVPN: \\"{safe_vpn}\\"\\n\\n이 VPN에 쓸 ~/.aws/config 의 SSO 프로필을 한 개 고르세요. (건너뛰려면 선택 해제 후 확인)" ¬
+    without multiple selections allowed ¬
+    with empty selection allowed
+if chosen is false then
+    return ""
+end if
+if (count of chosen) is 0 then
+    return ""
+end if
+return item 1 of chosen
+"""
+    try:
+        result = subprocess.run(
+            [CMD_OSASCRIPT, "-e", apple_script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        out = result.stdout.strip()
+        if not out:
+            log.info(f"VPN↔SSO 매핑 건너뜀 또는 취소: VPN={vpn_profile_name!r}")
+            return None
+        if out in sso_profiles:
+            return out
+        log.warning(f"다이얼로그 결과가 목록에 없음: {out!r}")
+        return None
+    except subprocess.TimeoutExpired:
+        log.warning("VPN↔SSO 매핑 다이얼로그 시간 초과")
+        return None
+    except Exception as e:
+        log.error(f"VPN↔SSO 매핑 다이얼로그 실패: {e}")
+        return None
+
+
+def prompt_and_save_vpn_sso_mappings(unresolved_vpns: List[str], all_sso: List[str]) -> dict[str, str]:
+    """미해결 VPN 각각에 대해 다이얼로그로 매핑을 받아 파일에 병합 저장합니다."""
+    before = load_vpn_sso_mappings()
+    current = dict(before)
+    for vpn in unresolved_vpns:
+        chosen = ask_sso_profile_for_vpn_mapping_dialog(vpn, all_sso)
+        if chosen:
+            current[vpn] = chosen
+    if current != before:
+        save_vpn_sso_mappings(current)
+    return current
+
+
+def resolve_watched_sso_profiles(
+    all_sso: List[str],
+    vpn_names: Optional[Set[str]],
+    mappings: dict[str, str],
+    *,
+    verbose: bool = False,
+) -> List[str]:
+    """
+    감시할 SSO 프로필 목록.
+    - VPN ProfileName 과 동일한 이름의 SSO 프로필
+    - 또는 vpn-sso-mappings 에 저장된 대응
+    """
+    if vpn_names is None:
+        if verbose:
+            log.info(
+                "AWS VPN Client ConnectionProfiles 가 없습니다. "
+                "~/.aws/config 의 모든 SSO 프로필을 감시합니다 (레거시 모드)."
+            )
+        return list(all_sso)
+
+    if not vpn_names:
+        if verbose:
+            log.info(
+                "AWS VPN Client 에 등록된 커넥션이 없습니다. "
+                "이번 점검에서는 SSO 프로필을 감시하지 않습니다."
+            )
+        return []
+
+    watched: Set[str] = set()
+    vpn_by_lower = {n.lower(): n for n in vpn_names}
+
+    for p in all_sso:
+        if p.lower() in vpn_by_lower:
+            watched.add(p)
+
+    for vpn in vpn_names:
+        if any(p.lower() == vpn.lower() for p in all_sso):
+            continue
+        mapped = _mapping_sso_for_vpn(mappings, vpn)
+        if mapped and mapped in all_sso:
+            watched.add(mapped)
+
+    by_name = sorted(p for p in all_sso if p.lower() in vpn_by_lower)
+    by_map = sorted(watched - set(by_name))
+
+    unresolved = _vpn_names_needing_user_mapping(all_sso, vpn_names, mappings)
+    if unresolved:
+        msg = (
+            "이름·매핑으로 아직 SSO 가 연결되지 않은 VPN 커넥션: "
+            + ", ".join(unresolved)
+        )
+        if verbose:
+            log.warning(msg)
+        else:
+            log.debug(msg)
+
+    if not watched and all_sso:
+        msg = (
+            "등록된 VPN 커넥션에 대응하는 SSO 프로필이 없습니다. "
+            f"VPN: {sorted(vpn_names)}, SSO: {all_sso} — "
+            f"이름을 맞추거나 매핑 파일을 편집하세요: {VPN_SSO_MAPPINGS_FILE}"
+        )
+        if verbose:
+            log.warning(msg)
+        else:
+            log.debug(msg)
+    elif verbose:
+        parts = []
+        if by_name:
+            parts.append(f"이름 일치 {len(by_name)}개: {by_name}")
+        if by_map:
+            parts.append(f"저장 매핑 {len(by_map)}개: {by_map}")
+        log.info(
+            "VPN 기준 감시 SSO 프로필 "
+            f"({len(watched)}개): "
+            + ("; ".join(parts) if parts else str(sorted(watched)))
+        )
+
+    return sorted(watched)
+
+
+def get_watched_sso_profiles(
+    all_sso: List[str], *, verbose: bool = False, offer_mapping_ui: bool = False
+) -> List[str]:
+    """
+    ConnectionProfiles + (이름 일치 | vpn-sso-mappings.json) 으로 감시 대상 SSO 목록.
+    offer_mapping_ui=True 이면, VPN 연결 직후 등에서 미매칭 커넥션에 대해 매핑 다이얼로그를 띄웁니다.
+    """
+    vpn_names = load_aws_vpn_client_connection_profile_names()
+    if vpn_names is None:
+        return resolve_watched_sso_profiles(all_sso, None, {}, verbose=verbose)
+
+    mappings = load_vpn_sso_mappings()
+    unresolved = _vpn_names_needing_user_mapping(all_sso, vpn_names, mappings)
+
+    if offer_mapping_ui and unresolved and all_sso:
+        try:
+            os.makedirs(VPN_SSO_MAPPINGS_DIR, exist_ok=True)
+        except Exception:
+            pass
+        notify(
+            "AWS VPN Watcher — VPN↔SSO 매핑",
+            "이름이 다른 커넥션이 있습니다. 다음 창에서 SSO 프로필을 골라 주세요. "
+            f"(저장: {VPN_SSO_MAPPINGS_FILE})",
+            on_click=VPN_SSO_MAPPINGS_DIR,
+        )
+        mappings = prompt_and_save_vpn_sso_mappings(unresolved, all_sso)
+
+    return resolve_watched_sso_profiles(all_sso, vpn_names, mappings, verbose=verbose)
 
 
 # ──────────────────────────────────────────────
@@ -630,10 +918,15 @@ def run_sso_login_async(profiles: List[str], reason: str = ""):
 # ──────────────────────────────────────────────
 # 메인 루프
 # ──────────────────────────────────────────────
-def main():
+def main(*, skip_sso_login: bool = False):
     log.info("=" * 50)
     log.info("AWS VPN Watcher 시작")
     log.info(f"감지 주기: {POLL_INTERVAL}초")
+    if skip_sso_login:
+        log.info(
+            "SSO 자동 로그인 비활성: 만료 시 프로필 다이얼로그·aws sso login 을 실행하지 않습니다 "
+            "(--no-sso-login 또는 AWS_VPN_WATCHER_SKIP_SSO_LOGIN)"
+        )
     log.info(
         f"연결 유지 중 SSO 재점검: {SSO_RECHECK_WHILE_CONNECTED_SEC}초마다 "
         f"(만료 전환 시 알림·다이얼로그)"
@@ -669,15 +962,29 @@ def main():
                 # 연결 안정화 대기
                 time.sleep(STABILIZE_DELAY)
 
-                # ~/.aws/config 에서 SSO 프로필 실시간 탐색
-                available = discover_sso_profiles()
+                # VPN 클라이언트 등록 커넥션에 해당하는 SSO 만 (이름 일치 또는 저장된 매핑; 미매칭 시 다이얼로그)
+                all_sso = discover_sso_profiles()
+                available = get_watched_sso_profiles(
+                    all_sso, verbose=True, offer_mapping_ui=True
+                )
                 if not available:
-                    log.warning("SSO 프로필을 찾을 수 없습니다. ~/.aws/config 를 확인하세요.")
-                    notify(
-                        "AWS VPN Watcher ⚠️",
-                        "SSO 프로필을 찾을 수 없습니다.",
-                        on_click=os.path.expanduser("~/.aws/config"),
-                    )
+                    if not all_sso:
+                        log.warning("SSO 프로필을 찾을 수 없습니다. ~/.aws/config 를 확인하세요.")
+                        notify(
+                            "AWS VPN Watcher ⚠️",
+                            "SSO 프로필을 찾을 수 없습니다.",
+                            on_click=os.path.expanduser("~/.aws/config"),
+                        )
+                    else:
+                        log.warning(
+                            "VPN 에서 감시할 SSO 프로필을 정하지 못했습니다. "
+                            f"이름을 맞추거나 매핑을 확인하세요: {VPN_SSO_MAPPINGS_FILE}"
+                        )
+                        notify(
+                            "AWS VPN Watcher ⚠️",
+                            "VPN에 대응하는 SSO 프로필이 없습니다. 이름 일치 또는 매핑을 설정하세요.",
+                            on_click=VPN_SSO_MAPPINGS_DIR,
+                        )
                     connected_sso_all_valid_prev = None
                     last_mid_sso_check_ts = time.time()
                     was_connected = connected
@@ -705,12 +1012,30 @@ def main():
                     was_connected = connected
                     continue
 
+                if skip_sso_login:
+                    log.info(
+                        "만료된 SSO 가 있으나 자동 로그인 비활성 옵션으로 "
+                        f"다이얼로그·aws sso login 을 건너뜁니다: {', '.join(expired)}"
+                    )
+                    notify(
+                        "AWS SSO 만료 (로그인 안 함 모드)",
+                        "만료된 프로필이 있습니다. 필요 시 터미널에서 aws sso login 하세요.",
+                        on_click="log",
+                    )
+                    connected_sso_all_valid_prev = False
+                    last_mid_sso_check_ts = time.time()
+                    was_connected = connected
+                    continue
+
                 # 만료된 프로필만 다이얼로그에 표시
                 selected = ask_profiles_via_dialog(expired)
 
                 if selected:
                     run_sso_login_async(selected, reason="VPN 연결 직후 만료 프로필")
-                    available = discover_sso_profiles(verbose=False)
+                    all_sso = discover_sso_profiles(verbose=False)
+                    available = get_watched_sso_profiles(
+                        all_sso, verbose=False, offer_mapping_ui=False
+                    )
                     valid_after = [p for p in available if is_sso_session_valid(p)]
                     expired_after = [p for p in available if p not in valid_after]
                     connected_sso_all_valid_prev = len(expired_after) == 0
@@ -737,12 +1062,33 @@ def main():
                 now_ts = time.time()
                 if now_ts - last_mid_sso_check_ts >= SSO_RECHECK_WHILE_CONNECTED_SEC:
                     last_mid_sso_check_ts = now_ts
-                    available = discover_sso_profiles(verbose=False)
+                    all_sso = discover_sso_profiles(verbose=False)
+                    available = get_watched_sso_profiles(
+                        all_sso, verbose=False, offer_mapping_ui=False
+                    )
                     if available:
                         valid = [p for p in available if is_sso_session_valid(p)]
                         expired = [p for p in available if p not in valid]
                         if expired:
-                            if connected_sso_all_valid_prev is True:
+                            if skip_sso_login:
+                                if connected_sso_all_valid_prev is True:
+                                    log.info(
+                                        "VPN 유지 중 SSO 만료 — 자동 로그인 비활성로 "
+                                        "다이얼로그·aws sso login 생략: "
+                                        + ", ".join(expired)
+                                    )
+                                    notify(
+                                        "AWS SSO 만료 (로그인 안 함 모드)",
+                                        "SSO가 만료됐습니다. 필요 시 터미널에서 로그인하세요.",
+                                        on_click="log",
+                                    )
+                                else:
+                                    log.debug(
+                                        "VPN 유지 중 SSO 여전히 만료 (로그인 안 함 모드, 알림 생략): "
+                                        + ", ".join(expired)
+                                    )
+                                connected_sso_all_valid_prev = False
+                            elif connected_sso_all_valid_prev is True:
                                 log.info(
                                     "VPN 연결 유지 중 SSO 만료 감지 "
                                     "(직전 점검까지 모든 프로필 유효)"
@@ -758,7 +1104,10 @@ def main():
                                         selected,
                                         reason="VPN 연결 유지 중 SSO 만료",
                                     )
-                                    available = discover_sso_profiles(verbose=False)
+                                    all_sso = discover_sso_profiles(verbose=False)
+                                    available = get_watched_sso_profiles(
+                                        all_sso, verbose=False, offer_mapping_ui=False
+                                    )
                                     valid_after = [
                                         p for p in available if is_sso_session_valid(p)
                                     ]
@@ -775,7 +1124,8 @@ def main():
                                     connected_sso_all_valid_prev = False
                             elif connected_sso_all_valid_prev is False:
                                 if (
-                                    now_ts - last_still_expired_notify_ts
+                                    not skip_sso_login
+                                    and now_ts - last_still_expired_notify_ts
                                     >= STILL_EXPIRED_NOTIFY_INTERVAL_SEC
                                 ):
                                     notify(
@@ -804,4 +1154,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _parser = argparse.ArgumentParser(
+        description="AWS VPN Client 연결 시 AWS SSO 로그인을 돕는 macOS watcher",
+    )
+    _parser.add_argument(
+        "--no-sso-login",
+        action="store_true",
+        help="만료 시 프로필 선택 다이얼로그와 aws sso login 을 실행하지 않습니다.",
+    )
+    _args = _parser.parse_args()
+    main(
+        skip_sso_login=_args.no_sso_login
+        or _env_truthy("AWS_VPN_WATCHER_SKIP_SSO_LOGIN"),
+    )

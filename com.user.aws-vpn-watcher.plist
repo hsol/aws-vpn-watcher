@@ -33,6 +33,9 @@
         <string>HOME_PLACEHOLDER/.aws/config</string>
         <key>AWS_SHARED_CREDENTIALS_FILE</key>
         <string>HOME_PLACEHOLDER/.aws/credentials</string>
+        <!-- 만료 시 aws sso login 을 끄려면 위 dict 안에 다음 두 줄을 추가하세요:
+             <key>AWS_VPN_WATCHER_SKIP_SSO_LOGIN</key>
+             <string>1</string> -->
     </dict>
 </dict>
 </plist>
