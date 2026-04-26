@@ -38,6 +38,12 @@ STILL_EXPIRED_NOTIFY_INTERVAL_SEC = 900
 AUTO_UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60
 # SSO 로그인 1회 최대 대기 시간 (초)
 SSO_LOGIN_TIMEOUT_SEC = 180
+# 대기(절전) 해제 직후 쿨다운 (초)
+STANDBY_EXIT_COOLDOWN_SEC = 15
+# 루프 간격이 이 값보다 크게 벌어지면 수면/대기 복귀로 간주 (초)
+SUSPEND_GAP_DETECT_SEC = 20
+# 자동 재로그인(만료 지속) 시 잠금·스크린세이버로 판단될 때 브라우저를 열지 않음
+# AWS_VPN_WATCHER_IGNORE_ATTENDANCE_GUARD=1 이면 이 감지를 끕니다.
 HOME_DIR = os.path.expanduser("~")
 AUTO_UPDATE_STATE_CANDIDATES = [
     os.path.join(HOME_DIR, ".local", "log", "aws-vpn-watcher-update.json"),
@@ -704,8 +710,42 @@ return output
         return []
     except Exception as e:
         log.error(f"다이얼로그 실행 실패: {e}")
-        # 폴백: 모든 프로필 사용
-        return profiles
+        # 잠금·세션 제약 등으로 실패할 수 있음 — 폴백으로 전 프로필 로그인하면
+        # aws sso login 이 반복되어 크롬 탭이 폭증하므로 빈 선택으로 처리합니다.
+        return []
+
+
+def _likely_user_cannot_complete_browser_sso() -> bool:
+    """
+    잠금 화면·스크린세이버 등으로 브라우저 인증이 사실상 불가능할 때 True.
+    System Events 접근이 안 되면 False(판단 불가 → 기존과 동일하게 진행).
+    """
+    if _env_truthy("AWS_VPN_WATCHER_IGNORE_ATTENDANCE_GUARD"):
+        return False
+    try:
+        script = (
+            'tell application "System Events" to '
+            "return name of first process whose frontmost is true"
+        )
+        r = subprocess.run(
+            [CMD_OSASCRIPT, "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if r.returncode != 0:
+            return False
+        name = (r.stdout or "").strip().lower()
+        if name in ("loginwindow", "screensaverengine"):
+            log.info(
+                "전면 프로세스가 잠금/스크린세이버로 보여 SSO 브라우저 절차를 건너뜁니다 "
+                f"({name!r})"
+            )
+            return True
+        return False
+    except Exception as e:
+        log.debug(f"잠금·세이버 판별 실패(무시하고 진행): {e}")
+        return False
 
 
 # ──────────────────────────────────────────────
@@ -794,15 +834,26 @@ def open_browser(url: str):
         log.error(f"브라우저 열기 실패: {e}")
 
 
-def run_sso_login(profiles: List[str]):
+def run_sso_login(
+    profiles: List[str], *, require_user_present: bool = True
+):
     """
     aws sso login을 Python subprocess로 직접 실행합니다.
     stdout을 실시간으로 읽어 authorization URL이 나오면
     /usr/bin/open 으로 브라우저를 직접 엽니다.
     프로필은 순서대로 하나씩 처리합니다.
+
+    require_user_present=False 이면(자동 재시도 등) 잠금·스크린세이버로 보일 때
+    전체 로그인을 생략해 크롬 탭 폭주를 막습니다.
     """
     if not profiles:
         log.info("선택된 프로필 없음 - 로그인 생략")
+        return
+
+    if not require_user_present and _likely_user_cannot_complete_browser_sso():
+        log.info(
+            "자동 SSO 재시도 — 사용자 자리 비움/잠금으로 보여 aws sso login 을 실행하지 않습니다."
+        )
         return
 
     # plist EnvironmentVariables 에 HOME / AWS_CONFIG_FILE 등이 이미 설정돼 있으므로
@@ -891,7 +942,12 @@ def run_sso_login(profiles: List[str]):
             notify("AWS SSO Login ❌", f"{profile} 오류 발생")
 
 
-def run_sso_login_async(profiles: List[str], reason: str = ""):
+def run_sso_login_async(
+    profiles: List[str],
+    reason: str = "",
+    *,
+    require_user_present: bool = True,
+):
     global _sso_login_running
     if not profiles:
         return
@@ -907,7 +963,7 @@ def run_sso_login_async(profiles: List[str], reason: str = ""):
         try:
             if reason:
                 log.info(f"SSO 로그인 비동기 실행 시작 — 이유: {reason}")
-            run_sso_login(profiles)
+            run_sso_login(profiles, require_user_present=require_user_present)
         finally:
             with _sso_login_lock:
                 _sso_login_running = False
@@ -941,12 +997,35 @@ def main(*, skip_sso_login: bool = False):
     # 직전 VPN 연결 유지 점검에서 SSO가 전부 유효했는지 (만료 전환 감지용)
     connected_sso_all_valid_prev: Optional[bool] = None
     last_mid_sso_check_ts = 0.0
-    last_still_expired_notify_ts = 0.0
+    # 0이면 (now - 0) >= STILL_EXPIRED... 가 항상 참이 되어 자동 재로그인이 과도해짐
+    last_still_expired_notify_ts = time.time()
+    last_loop_ts = time.time()
+    standby_exited_at_ts = 0.0
 
     while True:
         try:
             now_ts = time.time()
+            loop_gap = now_ts - last_loop_ts
+            last_loop_ts = now_ts
             maybe_trigger_daily_auto_update(now_ts)
+
+            # 시스템 수면/대기 중에는 프로세스 루프가 멈췄다가 복귀 시 시간 점프가 생깁니다.
+            # 디스플레이 상태 API 편차를 피하기 위해 루프 간격 기반으로 복귀를 감지합니다.
+            if loop_gap >= SUSPEND_GAP_DETECT_SEC:
+                standby_exited_at_ts = now_ts
+                log.info(
+                    "macOS 대기/수면 복귀 감지 "
+                    f"(루프 간격 {int(loop_gap)}초). "
+                    f"{STANDBY_EXIT_COOLDOWN_SEC}초 쿨다운 동안 watcher 동작을 보류합니다."
+                )
+            if standby_exited_at_ts and (
+                now_ts - standby_exited_at_ts < STANDBY_EXIT_COOLDOWN_SEC
+            ):
+                # 대기/수면 복귀 직후 쿨다운 구간에서도 로그인/알림 플로우를 막음
+                was_connected = False
+                connected_sso_all_valid_prev = None
+                time.sleep(POLL_INTERVAL)
+                continue
 
             connected = is_vpn_connected()
 
@@ -1027,8 +1106,17 @@ def main(*, skip_sso_login: bool = False):
                     was_connected = connected
                     continue
 
-                # 만료된 프로필만 다이얼로그에 표시
-                selected = ask_profiles_via_dialog(expired)
+                # 만료된 프로필만 다이얼로그에 표시 (잠금·세이버 중에는 다이얼로그/브라우저 생략)
+                deferred_sso_due_to_lock = False
+                if _likely_user_cannot_complete_browser_sso():
+                    log.info(
+                        "VPN 연결 직후 SSO 만료 — 잠금/세이버 상태로 "
+                        "프로필 선택·aws sso login 을 건너뜁니다."
+                    )
+                    selected = []
+                    deferred_sso_due_to_lock = True
+                else:
+                    selected = ask_profiles_via_dialog(expired)
 
                 if selected:
                     run_sso_login_async(selected, reason="VPN 연결 직후 만료 프로필")
@@ -1040,12 +1128,23 @@ def main(*, skip_sso_login: bool = False):
                     expired_after = [p for p in available if p not in valid_after]
                     connected_sso_all_valid_prev = len(expired_after) == 0
                 else:
-                    log.info(
-                        f"로그인 생략 — 이유: 사용자가 다이얼로그에서 취소 | "
-                        f"대상 프로필: {expired}"
-                    )
-                    notify("AWS VPN Watcher", "SSO 로그인을 건너뛰었습니다.")
+                    if deferred_sso_due_to_lock:
+                        log.info(
+                            f"로그인 생략 — 잠금/세이버 | 대상 프로필: {expired}"
+                        )
+                        notify(
+                            "AWS VPN Watcher",
+                            "잠금 또는 스크린세이버 중에는 SSO 자동 로그인을 하지 않습니다. "
+                            "해제 후 잠시 두면 다시 안내합니다.",
+                        )
+                    else:
+                        log.info(
+                            f"로그인 생략 — 이유: 사용자가 다이얼로그에서 취소 | "
+                            f"대상 프로필: {expired}"
+                        )
+                        notify("AWS VPN Watcher", "SSO 로그인을 건너뛰었습니다.")
                     connected_sso_all_valid_prev = False
+                    last_still_expired_notify_ts = time.time()
                 last_mid_sso_check_ts = time.time()
 
             elif not connected and was_connected:
@@ -1056,7 +1155,7 @@ def main(*, skip_sso_login: bool = False):
                     on_click="aws_vpn",
                 )
                 connected_sso_all_valid_prev = None
-                last_still_expired_notify_ts = 0.0
+                last_still_expired_notify_ts = time.time()
 
             elif connected and was_connected:
                 now_ts = time.time()
@@ -1067,83 +1166,103 @@ def main(*, skip_sso_login: bool = False):
                         all_sso, verbose=False, offer_mapping_ui=False
                     )
                     if available:
-                        valid = [p for p in available if is_sso_session_valid(p)]
-                        expired = [p for p in available if p not in valid]
-                        if expired:
-                            if skip_sso_login:
-                                if connected_sso_all_valid_prev is True:
-                                    log.info(
-                                        "VPN 유지 중 SSO 만료 — 자동 로그인 비활성로 "
-                                        "다이얼로그·aws sso login 생략: "
-                                        + ", ".join(expired)
-                                    )
-                                    notify(
-                                        "AWS SSO 만료 (로그인 안 함 모드)",
-                                        "SSO가 만료됐습니다. 필요 시 터미널에서 로그인하세요.",
-                                        on_click="log",
-                                    )
-                                else:
-                                    log.debug(
-                                        "VPN 유지 중 SSO 여전히 만료 (로그인 안 함 모드, 알림 생략): "
-                                        + ", ".join(expired)
-                                    )
-                                connected_sso_all_valid_prev = False
-                            elif connected_sso_all_valid_prev is True:
-                                log.info(
-                                    "VPN 연결 유지 중 SSO 만료 감지 "
-                                    "(직전 점검까지 모든 프로필 유효)"
-                                )
-                                notify(
-                                    "AWS SSO 만료 🔐",
-                                    "VPN은 연결됐지만 SSO가 만료됐습니다. 재로그인할 프로필을 고르세요.",
-                                    on_click="log",
-                                )
-                                selected = ask_profiles_via_dialog(expired)
-                                if selected:
-                                    run_sso_login_async(
-                                        selected,
-                                        reason="VPN 연결 유지 중 SSO 만료",
-                                    )
-                                    all_sso = discover_sso_profiles(verbose=False)
-                                    available = get_watched_sso_profiles(
-                                        all_sso, verbose=False, offer_mapping_ui=False
-                                    )
-                                    valid_after = [
-                                        p for p in available if is_sso_session_valid(p)
-                                    ]
-                                    expired_after = [
-                                        p for p in available if p not in valid_after
-                                    ]
-                                    connected_sso_all_valid_prev = (
-                                        len(expired_after) == 0
-                                    )
-                                else:
-                                    log.info(
-                                        "연결 유지 중 만료 — 사용자가 재로그인 다이얼로그 취소"
-                                    )
-                                    connected_sso_all_valid_prev = False
-                            elif connected_sso_all_valid_prev is False:
-                                if (
-                                    not skip_sso_login
-                                    and now_ts - last_still_expired_notify_ts
-                                    >= STILL_EXPIRED_NOTIFY_INTERVAL_SEC
-                                ):
-                                    notify(
-                                        "AWS SSO 만료 — 자동 재로그인",
-                                        "세션이 아직 만료 상태여서 자동으로 재로그인을 시도합니다.",
-                                        on_click="log",
-                                    )
-                                    log.info(
-                                        "만료 상태 지속 감지 — 만료 프로필 자동 재로그인 시도: "
-                                        + ", ".join(expired)
-                                    )
-                                    run_sso_login_async(expired, reason="만료 상태 지속")
-                                    last_still_expired_notify_ts = now_ts
-                            else:
-                                connected_sso_all_valid_prev = False
+                        if _sso_login_running:
+                            log.debug(
+                                "SSO 로그인 워커가 돌아가는 중이라 이번 만료 점검은 생략합니다."
+                            )
                         else:
-                            connected_sso_all_valid_prev = True
-                            last_still_expired_notify_ts = 0.0
+                            valid = [p for p in available if is_sso_session_valid(p)]
+                            expired = [p for p in available if p not in valid]
+                            if expired:
+                                if skip_sso_login:
+                                    if connected_sso_all_valid_prev is True:
+                                        log.info(
+                                            "VPN 유지 중 SSO 만료 — 자동 로그인 비활성로 "
+                                            "다이얼로그·aws sso login 생략: "
+                                            + ", ".join(expired)
+                                        )
+                                        notify(
+                                            "AWS SSO 만료 (로그인 안 함 모드)",
+                                            "SSO가 만료됐습니다. 필요 시 터미널에서 로그인하세요.",
+                                            on_click="log",
+                                        )
+                                    else:
+                                        log.debug(
+                                            "VPN 유지 중 SSO 여전히 만료 (로그인 안 함 모드, 알림 생략): "
+                                            + ", ".join(expired)
+                                        )
+                                    connected_sso_all_valid_prev = False
+                                elif connected_sso_all_valid_prev is True:
+                                    if _likely_user_cannot_complete_browser_sso():
+                                        log.info(
+                                            "VPN 유지 중 SSO 만료 — 잠금/세이버 상태로 "
+                                            "프로필 다이얼로그·로그인을 건너뜁니다(해제 후 재점검)."
+                                        )
+                                    else:
+                                        log.info(
+                                            "VPN 연결 유지 중 SSO 만료 감지 "
+                                            "(직전 점검까지 모든 프로필 유효)"
+                                        )
+                                        notify(
+                                            "AWS SSO 만료 🔐",
+                                            "VPN은 연결됐지만 SSO가 만료됐습니다. 재로그인할 프로필을 고르세요.",
+                                            on_click="log",
+                                        )
+                                        selected = ask_profiles_via_dialog(expired)
+                                        if selected:
+                                            run_sso_login_async(
+                                                selected,
+                                                reason="VPN 연결 유지 중 SSO 만료",
+                                            )
+                                            all_sso = discover_sso_profiles(verbose=False)
+                                            available = get_watched_sso_profiles(
+                                                all_sso,
+                                                verbose=False,
+                                                offer_mapping_ui=False,
+                                            )
+                                            valid_after = [
+                                                p
+                                                for p in available
+                                                if is_sso_session_valid(p)
+                                            ]
+                                            expired_after = [
+                                                p for p in available if p not in valid_after
+                                            ]
+                                            connected_sso_all_valid_prev = (
+                                                len(expired_after) == 0
+                                            )
+                                        else:
+                                            log.info(
+                                                "연결 유지 중 만료 — 사용자가 재로그인 다이얼로그 취소"
+                                            )
+                                            connected_sso_all_valid_prev = False
+                                            last_still_expired_notify_ts = now_ts
+                                elif connected_sso_all_valid_prev is False:
+                                    if (
+                                        not skip_sso_login
+                                        and now_ts - last_still_expired_notify_ts
+                                        >= STILL_EXPIRED_NOTIFY_INTERVAL_SEC
+                                    ):
+                                        notify(
+                                            "AWS SSO 만료 — 자동 재로그인",
+                                            "세션이 아직 만료 상태여서 자동으로 재로그인을 시도합니다.",
+                                            on_click="log",
+                                        )
+                                        log.info(
+                                            "만료 상태 지속 감지 — 만료 프로필 자동 재로그인 시도: "
+                                            + ", ".join(expired)
+                                        )
+                                        run_sso_login_async(
+                                            expired,
+                                            reason="만료 상태 지속",
+                                            require_user_present=False,
+                                        )
+                                        last_still_expired_notify_ts = now_ts
+                                else:
+                                    connected_sso_all_valid_prev = False
+                            else:
+                                connected_sso_all_valid_prev = True
+                                last_still_expired_notify_ts = time.time()
 
             was_connected = connected
 
