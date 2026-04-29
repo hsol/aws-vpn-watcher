@@ -38,6 +38,10 @@ STILL_EXPIRED_NOTIFY_INTERVAL_SEC = 900
 AUTO_UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60
 # SSO 로그인 1회 최대 대기 시간 (초)
 SSO_LOGIN_TIMEOUT_SEC = 180
+# 로컬 캐시 기준 만료/불확실일 때 AWS CLI로 재검증할 최대 대기 시간(초)
+SSO_VALIDATION_TIMEOUT_SEC = 12
+# AWS CLI 재검증 결과 캐시 TTL(초) — 과도한 재검증 방지
+SSO_VALIDATION_CACHE_SEC = 45
 # 대기(절전) 해제 직후 쿨다운 (초)
 STANDBY_EXIT_COOLDOWN_SEC = 15
 # 루프 간격이 이 값보다 크게 벌어지면 수면/대기 복귀로 간주 (초)
@@ -134,6 +138,7 @@ _auto_update_lock = threading.Lock()
 _auto_update_running = False
 _sso_login_lock = threading.Lock()
 _sso_login_running = False
+_sso_validation_cache: dict[str, tuple[float, bool]] = {}
 
 
 def _run_auto_update():
@@ -546,6 +551,43 @@ def _check_cache_file(path: str, profile: str) -> Optional[bool]:
         return None
 
 
+def _validate_sso_via_aws_cli(profile: str) -> bool:
+    """
+    로컬 캐시가 만료/불확실할 때 AWS CLI로 세션 유효성을 한 번 더 확인합니다.
+    짧은 TTL 캐시를 두어 과도한 재검증을 방지합니다.
+    """
+    now_ts = time.time()
+    cached = _sso_validation_cache.get(profile)
+    if cached and now_ts - cached[0] < SSO_VALIDATION_CACHE_SEC:
+        return cached[1]
+
+    try:
+        result = subprocess.run(
+            [CMD_AWS, "sts", "get-caller-identity", "--profile", profile],
+            capture_output=True,
+            text=True,
+            timeout=SSO_VALIDATION_TIMEOUT_SEC,
+        )
+        ok = result.returncode == 0
+        if ok:
+            log.info(f"[{profile}] AWS CLI 재검증 성공 — SSO 세션 유효로 판단")
+        else:
+            err = (result.stdout or result.stderr or "").strip().splitlines()
+            err_head = err[0] if err else "unknown error"
+            log.info(f"[{profile}] AWS CLI 재검증 실패: {err_head}")
+        _sso_validation_cache[profile] = (now_ts, ok)
+        return ok
+    except subprocess.TimeoutExpired:
+        log.warning(
+            f"[{profile}] AWS CLI 재검증 시간 초과 ({SSO_VALIDATION_TIMEOUT_SEC}초)"
+        )
+    except Exception as e:
+        log.warning(f"[{profile}] AWS CLI 재검증 중 오류: {e}")
+
+    _sso_validation_cache[profile] = (now_ts, False)
+    return False
+
+
 def is_sso_session_valid(profile: str) -> bool:
     """
     ~/.aws/sso/cache/ 의 토큰 캐시를 확인해 SSO 세션이 유효한지 반환합니다.
@@ -581,13 +623,17 @@ def is_sso_session_valid(profile: str) -> bool:
     if start_url:
         candidates.append(hashlib.sha1(start_url.encode()).hexdigest())
 
+    saw_expired_candidate = False
+    saw_any_relevant_cache = False
+
     # ── 후보 파일 직접 확인 ─────────────────────
     for key in candidates:
         result = _check_cache_file(os.path.join(cache_dir, f"{key}.json"), profile)
         if result is True:
             return True
         if result is False:
-            return False  # 파일은 있는데 만료됨
+            saw_expired_candidate = True
+            saw_any_relevant_cache = True
 
     # ── fallback: 캐시 디렉토리 전체 스캔 ────────
     # 후보 키로 파일을 찾지 못한 경우, start_url이 일치하는 캐시를 찾습니다.
@@ -603,13 +649,23 @@ def is_sso_session_valid(profile: str) -> bool:
                 # start_url이 일치하는 파일인지 확인
                 if start_url and data.get("startUrl") != start_url:
                     continue
+                if start_url:
+                    saw_any_relevant_cache = True
                 result = _check_cache_file(fpath, profile)
                 if result is True:
                     return True
+                if result is False:
+                    saw_expired_candidate = True
             except Exception:
                 continue
     except Exception as e:
         log.warning(f"[{profile}] 캐시 스캔 실패: {e}")
+
+    # 로컬 캐시만으로 만료/불확실 판정 시, 실제 인증 가능 여부를 AWS CLI로 재검증
+    # (오탐으로 인한 과도한 로그인 요청을 줄이기 위함)
+    if saw_expired_candidate or not saw_any_relevant_cache:
+        if _validate_sso_via_aws_cli(profile):
+            return True
 
     log.info(f"[{profile}] 유효한 SSO 캐시 없음 → 로그인 필요")
     return False
